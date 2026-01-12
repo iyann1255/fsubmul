@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, UTC
 from typing import Optional, List, Dict, Tuple
 
+from pathlib import Path
+
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -19,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 # =========================
 # ENV (ONLY MANAGER BOT)
