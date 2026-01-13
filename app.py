@@ -29,7 +29,7 @@ load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 # ENV (ONLY MANAGER BOT REQUIRED)
 # =========================
 MANAGER_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MANAGER_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip().lstrip("@")  # optional now
+MANAGER_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip().lstrip("@")  # optional
 
 DB_CHANNEL_ID = int(os.getenv("DB_CHANNEL_ID", "0"))
 DB_PATH = os.getenv("SQLITE_PATH", "data.db")
@@ -50,24 +50,68 @@ CAPTION_TEMPLATE = os.getenv(
 )
 
 
-def is_admin(user_id: int) -> bool:
+# =========================
+# PERMISSIONS
+# =========================
+def is_superadmin(user_id: int) -> bool:
     return user_id in ADMIN_IDS if ADMIN_IDS else False
+
+
+def get_bot_key(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return (context.application.bot_data.get("BOT_KEY") or "").strip() or "unknown"
+
+
+def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return (context.application.bot_data.get("BOT_USERNAME") or "").strip().lstrip("@") or "unknown"
 
 
 # =========================
 # DB CORE
 # =========================
+def _db_execute(q: str, args: tuple = ()):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(q, args)
+    conn.commit()
+    conn.close()
+
+
+def _db_fetchone(q: str, args: tuple = ()) -> Optional[tuple]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(q, args)
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def _db_fetchall(q: str, args: tuple = ()) -> List[tuple]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(q, args)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def _table_has_column(table: str, column: str) -> bool:
+    rows = _db_fetchall(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in rows]  # (cid, name, type,...)
+    return column in cols
+
+
 def db_init():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # bot clients registry
+    # bots registry (owner_id required)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bots (
             bot_key TEXT PRIMARY KEY,
             token TEXT NOT NULL,
             username TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
+            owner_id INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -150,7 +194,7 @@ def db_init():
         )
     """)
 
-    # pending admin input
+    # pending admin input (per bot)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pending_actions (
             bot_key TEXT NOT NULL,
@@ -173,57 +217,38 @@ def db_init():
     conn.commit()
     conn.close()
 
-
-def _db_execute(q: str, args: tuple = ()):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(q, args)
-    conn.commit()
-    conn.close()
+    # Migration safety (older db might not have owner_id)
+    if not _table_has_column("bots", "owner_id"):
+        _db_execute("ALTER TABLE bots ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0")
 
 
-def _db_fetchone(q: str, args: tuple = ()) -> Optional[tuple]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(q, args)
-    row = cur.fetchone()
-    conn.close()
-    return row
+# =========================
+# DB HELPERS
+# =========================
+def db_bots_list() -> List[Tuple[str, str, int, int]]:
+    rows = _db_fetchall("SELECT bot_key, username, enabled, owner_id FROM bots ORDER BY created_at ASC")
+    return [(r[0], r[1], int(r[2]), int(r[3])) for r in rows]
 
 
-def _db_fetchall(q: str, args: tuple = ()) -> List[tuple]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(q, args)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-# bots registry
-def db_bots_list() -> List[Tuple[str, str, int]]:
-    rows = _db_fetchall("SELECT bot_key, username, enabled FROM bots ORDER BY created_at ASC")
-    return [(r[0], r[1], int(r[2])) for r in rows]
-
-
-def db_bots_get(bot_key: str) -> Optional[Tuple[str, str, str, int]]:
-    row = _db_fetchone("SELECT bot_key, token, username, enabled FROM bots WHERE bot_key=?", (bot_key,))
+def db_bots_get(bot_key: str) -> Optional[Tuple[str, str, str, int, int]]:
+    row = _db_fetchone("SELECT bot_key, token, username, enabled, owner_id FROM bots WHERE bot_key=?", (bot_key,))
     if not row:
         return None
-    return (row[0], row[1], row[2], int(row[3]))
+    return (row[0], row[1], row[2], int(row[3]), int(row[4]))
 
 
-def db_bots_upsert(bot_key: str, token: str, username: str, enabled: int = 1):
+def db_bots_upsert(bot_key: str, token: str, username: str, enabled: int, owner_id: int):
     now = datetime.now(UTC).isoformat()
     _db_execute("""
-        INSERT INTO bots(bot_key, token, username, enabled, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?)
+        INSERT INTO bots(bot_key, token, username, enabled, owner_id, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(bot_key) DO UPDATE SET
             token=excluded.token,
             username=excluded.username,
             enabled=excluded.enabled,
+            owner_id=excluded.owner_id,
             updated_at=excluded.updated_at
-    """, (bot_key, token, username, int(enabled), now, now))
+    """, (bot_key, token, username, int(enabled), int(owner_id), now, now))
 
 
 def db_bots_set_enabled(bot_key: str, enabled: int):
@@ -235,7 +260,6 @@ def db_bots_delete(bot_key: str):
     _db_execute("DELETE FROM bots WHERE bot_key=?", (bot_key,))
 
 
-# files/uploads
 def db_put_file(bot_key: str, token: str, db_message_id: int):
     _db_execute(
         "INSERT OR REPLACE INTO files(bot_key, token, db_message_id, created_at) VALUES (?, ?, ?, ?)",
@@ -245,7 +269,7 @@ def db_put_file(bot_key: str, token: str, db_message_id: int):
 
 def db_get_file(bot_key: str, token: str) -> Optional[int]:
     row = _db_fetchone(
-        "SELECT db_message_id FROM files WHERE bot_key = ? AND token = ?",
+        "SELECT db_message_id FROM files WHERE bot_key=? AND token=?",
         (bot_key, token),
     )
     return int(row[0]) if row else None
@@ -254,13 +278,13 @@ def db_get_file(bot_key: str, token: str) -> Optional[int]:
 def db_put_upload(bot_key: str, token: str, uploader_id: int, thumb_file_id: Optional[str]):
     _db_execute(
         "INSERT OR REPLACE INTO uploads(bot_key, token, uploader_id, thumb_file_id, created_at) VALUES (?, ?, ?, ?, ?)",
-        (bot_key, token, uploader_id, thumb_file_id or "", datetime.now(UTC).isoformat()),
+        (bot_key, token, int(uploader_id), thumb_file_id or "", datetime.now(UTC).isoformat()),
     )
 
 
 def db_get_upload(bot_key: str, token: str) -> Optional[Tuple[int, str]]:
     row = _db_fetchone(
-        "SELECT uploader_id, thumb_file_id FROM uploads WHERE bot_key = ? AND token = ?",
+        "SELECT uploader_id, thumb_file_id FROM uploads WHERE bot_key=? AND token=?",
         (bot_key, token),
     )
     if not row:
@@ -269,14 +293,13 @@ def db_get_upload(bot_key: str, token: str) -> Optional[Tuple[int, str]]:
 
 
 def db_del_upload(bot_key: str, token: str):
-    _db_execute("DELETE FROM uploads WHERE bot_key = ? AND token = ?", (bot_key, token))
+    _db_execute("DELETE FROM uploads WHERE bot_key=? AND token=?", (bot_key, token))
 
 
-# fsub rotate
 def db_get_fsub_offset(bot_key: str, token: str, user_id: int) -> int:
     row = _db_fetchone(
         "SELECT offset FROM fsub_state WHERE bot_key=? AND token=? AND user_id=?",
-        (bot_key, token, user_id),
+        (bot_key, token, int(user_id)),
     )
     return int(row[0]) if row else 0
 
@@ -284,7 +307,7 @@ def db_get_fsub_offset(bot_key: str, token: str, user_id: int) -> int:
 def db_set_fsub_offset(bot_key: str, token: str, user_id: int, offset: int):
     _db_execute(
         "INSERT OR REPLACE INTO fsub_state(bot_key, token, user_id, offset, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (bot_key, token, user_id, int(offset), datetime.now(UTC).isoformat()),
+        (bot_key, token, int(user_id), int(offset), datetime.now(UTC).isoformat()),
     )
 
 
@@ -296,10 +319,9 @@ def db_step_fsub_offset(bot_key: str, token: str, user_id: int, step: int, total
     return new_off
 
 
-# join link cache
 def db_get_join_link(bot_key: str, channel_key: str) -> Optional[str]:
     row = _db_fetchone(
-        "SELECT invite_link FROM join_links WHERE bot_key = ? AND channel_key = ?",
+        "SELECT invite_link FROM join_links WHERE bot_key=? AND channel_key=?",
         (bot_key, channel_key),
     )
     return row[0] if row else None
@@ -312,7 +334,6 @@ def db_set_join_link(bot_key: str, channel_key: str, invite_link: str):
     )
 
 
-# bot config + lists
 def db_botcfg_set(bot_key: str, cfg_key: str, cfg_val: str):
     _db_execute(
         "INSERT OR REPLACE INTO bot_config(bot_key, cfg_key, cfg_val) VALUES (?, ?, ?)",
@@ -322,7 +343,7 @@ def db_botcfg_set(bot_key: str, cfg_key: str, cfg_val: str):
 
 def db_botcfg_get(bot_key: str, cfg_key: str) -> Optional[str]:
     row = _db_fetchone(
-        "SELECT cfg_val FROM bot_config WHERE bot_key = ? AND cfg_key = ?",
+        "SELECT cfg_val FROM bot_config WHERE bot_key=? AND cfg_key=?",
         (bot_key, cfg_key),
     )
     return row[0] if row else None
@@ -359,7 +380,8 @@ def db_post_add(bot_key: str, channel_id: int, title: str):
 
 
 def db_post_del(bot_key: str, channel_id: int):
-    _db_execute("DELETE FROM bot_post_channels WHERE bot_key=? AND channel_id=?", (bot_key, int(channel_id)))
+    _db_execute("DELETE FROM bot_post_channels WHERE bot_key=? AND channel_id=?",
+                (bot_key, int(channel_id)))
 
 
 def db_post_clear(bot_key: str):
@@ -374,7 +396,6 @@ def db_post_list(bot_key: str) -> List[Tuple[int, str]]:
     return [(int(r[0]), str(r[1])) for r in rows]
 
 
-# pending actions
 def db_pending_set(bot_key: str, admin_id: int, action: str, payload: str = ""):
     _db_execute(
         "INSERT OR REPLACE INTO pending_actions(bot_key, admin_id, action, payload, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -393,10 +414,10 @@ def db_pending_get(bot_key: str, admin_id: int) -> Optional[Tuple[str, str]]:
 
 
 def db_pending_clear(bot_key: str, admin_id: int):
-    _db_execute("DELETE FROM pending_actions WHERE bot_key=? AND admin_id=?", (bot_key, int(admin_id)))
+    _db_execute("DELETE FROM pending_actions WHERE bot_key=? AND admin_id=?",
+                (bot_key, int(admin_id)))
 
 
-# settings (thumb)
 def db_set(key: str, value: str):
     _db_execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, value))
 
@@ -411,16 +432,30 @@ def db_del(key: str):
 
 
 # =========================
-# CONFIG GETTERS
+# OWNER CHECK (MAIN FEATURE YOU ASKED)
 # =========================
-def get_bot_key(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return (context.application.bot_data.get("BOT_KEY") or "").strip() or "unknown"
+def get_owner_id(bot_key: str) -> Optional[int]:
+    row = _db_fetchone("SELECT owner_id FROM bots WHERE bot_key=?", (bot_key,))
+    return int(row[0]) if row else None
 
 
-def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return (context.application.bot_data.get("BOT_USERNAME") or "").strip().lstrip("@") or "unknown"
+def can_manage_this_bot(bot_key: str, user_id: int) -> bool:
+    # superadmin bypass
+    if is_superadmin(user_id):
+        return True
+
+    # manager bot itself: only superadmin can manage
+    # (karena manager bukan "bot client" yang di-add oleh user)
+    if bot_key == "manager" or bot_key == (MANAGER_USERNAME_ENV or ""):
+        return False
+
+    owner_id = get_owner_id(bot_key)
+    return bool(owner_id and int(owner_id) == int(user_id))
 
 
+# =========================
+# CONFIG GETTERS / TOKENS
+# =========================
 def get_fsub_show_n(bot_key: str) -> int:
     v = db_botcfg_get(bot_key, "fsub_show_n")
     if v and v.isdigit():
@@ -477,7 +512,6 @@ async def is_user_joined_all(context: ContextTypes.DEFAULT_TYPE, bot_key: str, u
 
 
 async def ensure_invite_link(context: ContextTypes.DEFAULT_TYPE, bot_key: str, ch: str) -> str:
-    # public username
     if ch.startswith("@"):
         return f"https://t.me/{ch.lstrip('@')}"
     if ch and not ch.startswith("-") and re.fullmatch(r"[A-Za-z0-9_]{5,}", ch):
@@ -526,7 +560,6 @@ async def build_fsub_keyboard(context: ContextTypes.DEFAULT_TYPE, bot_key: str, 
         if len(row) == 2:
             rows.append(row)
             row = []
-
     if row:
         rows.append(row)
 
@@ -593,16 +626,26 @@ async def _post_to_channel(context: ContextTypes.DEFAULT_TYPE, channel_id: int, 
 
 
 # =========================
-# ADMIN UI
+# ADMIN UI (BUTTONS)
 # =========================
-def admin_panel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 BOTS", callback_data="adm:bots"),
-         InlineKeyboardButton("⚙️ FSUB", callback_data="adm:fsub")],
-        [InlineKeyboardButton("📤 POST", callback_data="adm:post"),
-         InlineKeyboardButton("🖼️ Thumb", callback_data="adm:thumb")],
-        [InlineKeyboardButton("✖️ Close", callback_data="adm:close")]
-    ])
+def admin_panel_kb(is_manager: bool) -> InlineKeyboardMarkup:
+    # Manager can show BOTS panel, clients don't need it
+    if is_manager:
+        rows = [
+            [InlineKeyboardButton("🤖 BOTS", callback_data="adm:bots"),
+             InlineKeyboardButton("⚙️ FSUB", callback_data="adm:fsub")],
+            [InlineKeyboardButton("📤 POST", callback_data="adm:post"),
+             InlineKeyboardButton("🖼️ Thumb", callback_data="adm:thumb")],
+            [InlineKeyboardButton("✖️ Close", callback_data="adm:close")]
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton("⚙️ FSUB", callback_data="adm:fsub"),
+             InlineKeyboardButton("📤 POST", callback_data="adm:post")],
+            [InlineKeyboardButton("🖼️ Thumb", callback_data="adm:thumb")],
+            [InlineKeyboardButton("✖️ Close", callback_data="adm:close")]
+        ]
+    return InlineKeyboardMarkup(rows)
 
 
 def bots_panel_kb() -> InlineKeyboardMarkup:
@@ -667,9 +710,10 @@ class BotManager:
         app = self.apps.get(bot_key)
         return bool(app and getattr(app, "running", False))
 
-    async def _wire_handlers(self, app: Application, bot_key: str, bot_username: str):
+    async def _wire_handlers(self, app: Application, bot_key: str, bot_username: str, is_manager: bool):
         app.bot_data["BOT_KEY"] = bot_key
         app.bot_data["BOT_USERNAME"] = bot_username
+        app.bot_data["IS_MANAGER"] = bool(is_manager)
 
         # Core
         app.add_handler(CommandHandler("start", start_cmd))
@@ -691,7 +735,6 @@ class BotManager:
         app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
     async def start_client(self, token: str) -> Tuple[str, str]:
-        # validate token + get username
         tmp = Application.builder().token(token).build()
         await tmp.initialize()
         me = await tmp.bot.get_me()
@@ -703,14 +746,11 @@ class BotManager:
         bot_key = username
 
         async with self.lock:
-            if bot_key in self.apps:
-                # ensure running
-                app = self.apps[bot_key]
-                if getattr(app, "running", False):
-                    return bot_key, username
+            if bot_key in self.apps and getattr(self.apps[bot_key], "running", False):
+                return bot_key, username
 
             app = Application.builder().token(token).build()
-            await self._wire_handlers(app, bot_key, username)
+            await self._wire_handlers(app, bot_key, username, is_manager=False)
 
             await app.initialize()
             await app.start()
@@ -739,12 +779,11 @@ class BotManager:
             self.apps.pop(bot_key, None)
 
     async def load_and_start_all(self):
-        rows = _db_fetchall("SELECT token, username FROM bots WHERE enabled=1")
-        for token, username in rows:
+        rows = _db_fetchall("SELECT token FROM bots WHERE enabled=1")
+        for (token,) in rows:
             try:
                 await self.start_client(str(token))
             except Exception:
-                # skip invalid token, don't crash
                 pass
 
 
@@ -756,6 +795,7 @@ BOT_MANAGER = BotManager()
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+
     bot_key = get_bot_key(context)
     bot_u = get_bot_username(context)
 
@@ -777,7 +817,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info += f"\nFSUB: {len(fsubs)} channel | tombol tampil: {min(show_n, len(fsubs)) if fsubs else 0}"
         info += f"\nPOST targets: {len(posts)} channel"
         if not posts:
-            info += "\nWarning: POST target kosong. Set via /admin → POST."
+            info += "\nWarning: POST target kosong. Set via /admin → POST → Add."
         return await msg.reply_text(info)
 
     token = context.args[0].strip()
@@ -937,7 +977,7 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not up:
             return await q.edit_message_text("Session udah nggak ada / token invalid.")
         uploader_id, _ = up
-        if q.from_user.id != uploader_id and not is_admin(q.from_user.id):
+        if q.from_user.id != uploader_id and not can_manage_this_bot(bot_key, q.from_user.id):
             return await q.answer("Bukan upload kamu.", show_alert=True)
         db_del_upload(bot_key, token)
         return await q.edit_message_text("✖️ Dibatalkan. Videonya tetap aman di DB.")
@@ -953,7 +993,7 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not up:
             return await q.edit_message_text("Session udah nggak ada / token invalid.")
         uploader_id, thumb_file_id = up
-        if q.from_user.id != uploader_id and not is_admin(q.from_user.id):
+        if q.from_user.id != uploader_id and not can_manage_this_bot(bot_key, q.from_user.id):
             return await q.answer("Bukan upload kamu.", show_alert=True)
 
         if idx < 1 or idx > len(post_channels):
@@ -976,7 +1016,7 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not up:
             return await q.edit_message_text("Session udah nggak ada / token invalid.")
         uploader_id, thumb_file_id = up
-        if q.from_user.id != uploader_id and not is_admin(q.from_user.id):
+        if q.from_user.id != uploader_id and not can_manage_this_bot(bot_key, q.from_user.id):
             return await q.answer("Bukan upload kamu.", show_alert=True)
 
         caption = CAPTION_TEMPLATE.format(date=datetime.now().strftime("%Y-%m-%d %H:%M")) + "\n\n🔗 <b>Link:</b>\n" + deep_link(bot_u, token)
@@ -997,14 +1037,26 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# ADMIN HANDLERS
+# ADMIN HANDLERS (OWNER-BASED)
 # =========================
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-    if not user or not is_admin(user.id):
-        return await msg.reply_text("Khusus admin.")
-    await msg.reply_text("Admin Panel:", reply_markup=admin_panel_kb())
+    if not user:
+        return
+
+    bot_key = get_bot_key(context)
+    is_manager = bool(context.application.bot_data.get("IS_MANAGER", False))
+
+    # manager panel: only superadmin
+    if is_manager and not is_superadmin(user.id):
+        return await msg.reply_text("Khusus superadmin.")
+
+    # client bot panel: owner (or superadmin)
+    if not is_manager and not can_manage_this_bot(bot_key, user.id):
+        return await msg.reply_text("Khusus pemilik bot ini (owner).")
+
+    await msg.reply_text("Admin Panel:", reply_markup=admin_panel_kb(is_manager=is_manager))
 
 
 async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1012,10 +1064,20 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
     user = q.from_user
-    if not user or not is_admin(user.id):
-        return await q.answer("Khusus admin.", show_alert=True)
+    if not user:
+        return
 
     bot_key = get_bot_key(context)
+    is_manager = bool(context.application.bot_data.get("IS_MANAGER", False))
+
+    # permission gate
+    if is_manager:
+        if not is_superadmin(user.id):
+            return await q.answer("Khusus superadmin.", show_alert=True)
+    else:
+        if not can_manage_this_bot(bot_key, user.id):
+            return await q.answer("Khusus owner bot ini.", show_alert=True)
+
     data = q.data or ""
     await q.answer()
 
@@ -1026,14 +1088,11 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if data == "adm:back":
-        return await q.edit_message_text("Admin Panel:", reply_markup=admin_panel_kb())
+        return await q.edit_message_text("Admin Panel:", reply_markup=admin_panel_kb(is_manager=is_manager))
 
     if data == "adm:cancel":
         db_pending_clear(bot_key, user.id)
-        return await q.edit_message_text("Input mode dibatalkan.", reply_markup=admin_panel_kb())
-
-    if data == "adm:bots":
-        return await q.edit_message_text("BOTS Panel:", reply_markup=bots_panel_kb())
+        return await q.edit_message_text("Input mode dibatalkan.", reply_markup=admin_panel_kb(is_manager=is_manager))
 
     if data == "adm:fsub":
         return await q.edit_message_text("FSUB Panel:", reply_markup=fsub_panel_kb())
@@ -1043,18 +1102,24 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "adm:thumb":
         return await q.edit_message_text(
-            "Thumb pakai command (aman):\n"
+            "Thumb pakai command:\n"
             "• Reply foto → /setthumb\n"
             "• /showthumb\n"
             "• /delthumb",
-            reply_markup=admin_panel_kb(),
+            reply_markup=admin_panel_kb(is_manager=is_manager),
         )
 
-    # ---- BOTS
+    # Manager-only: bots registry
+    if data == "adm:bots":
+        if not is_manager:
+            return await q.answer("Menu ini cuma ada di manager.", show_alert=True)
+        return await q.edit_message_text("BOTS Panel:", reply_markup=bots_panel_kb())
+
     if data == "adm:bots:add":
         db_pending_set(bot_key, user.id, "bot_add")
         return await q.edit_message_text(
-            "Kirim BOT TOKEN dari BotFather.\nNanti aku validasi dan langsung nyalain botnya.",
+            "Kirim BOT TOKEN dari BotFather.\nNanti aku validasi dan langsung nyalain botnya.\n\n"
+            "Owner bot ini = kamu.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
         )
 
@@ -1063,10 +1128,10 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not bots:
             return await q.edit_message_text("Belum ada bot client.", reply_markup=bots_panel_kb())
         lines = []
-        for bk, u, en in bots:
+        for bk, u, en, oid in bots:
             status = "ON" if en == 1 else "OFF"
             running = "RUN" if BOT_MANAGER.is_running(bk) else "STOP"
-            lines.append(f"• @{u} | {status} | {running}")
+            lines.append(f"• @{u} | {status} | {running} | owner:{oid}")
         return await q.edit_message_text("Bots:\n" + "\n".join(lines), reply_markup=bots_panel_kb())
 
     if data == "adm:bots:stop":
@@ -1083,7 +1148,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
         )
 
-    # ---- FSUB
+    # FSUB
     if data == "adm:fsub:add":
         db_pending_set(bot_key, user.id, "fsub_add")
         return await q.edit_message_text(
@@ -1113,7 +1178,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_fsub_del(bot_key, ch)
         return await q.edit_message_text("✅ Deleted.", reply_markup=fsub_list_kb(bot_key))
 
-    # ---- POST
+    # POST
     if data == "adm:post:add":
         db_pending_set(bot_key, user.id, "post_add")
         return await q.edit_message_text(
@@ -1143,18 +1208,33 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-    if not user or not is_admin(user.id):
+    if not user:
         return
     if update.effective_chat and update.effective_chat.type != "private":
         return
 
     bot_key = get_bot_key(context)
+    is_manager = bool(context.application.bot_data.get("IS_MANAGER", False))
+
+    # permission gate
+    if is_manager:
+        if not is_superadmin(user.id):
+            return
+    else:
+        if not can_manage_this_bot(bot_key, user.id):
+            return
+
     pending = db_pending_get(bot_key, user.id)
     if not pending:
         return
 
     action, _ = pending
     text = (msg.text or "").strip()
+
+    # Manager-only actions
+    if action in ("bot_add", "bot_stop", "bot_remove") and not is_manager:
+        db_pending_clear(bot_key, user.id)
+        return await msg.reply_text("Aksi ini cuma dari manager.")
 
     if action == "bot_add":
         token = text
@@ -1163,9 +1243,12 @@ async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             return await msg.reply_text(f"Token invalid / gagal start bot: {e}")
 
-        db_bots_upsert(bot_key_new, token, username, enabled=1)
+        # owner_id = user who added token
+        db_bots_upsert(bot_key_new, token, username, enabled=1, owner_id=user.id)
+
         db_pending_clear(bot_key, user.id)
-        return await msg.reply_text(f"✅ Bot client @{username} berhasil ditambah & langsung ON.", reply_markup=admin_panel_kb())
+        return await msg.reply_text(f"✅ Bot client @{username} berhasil ditambah & langsung ON.\nOwner: {user.id}",
+                                    reply_markup=admin_panel_kb(is_manager=True))
 
     if action == "bot_stop":
         uname = text.lstrip("@").strip()
@@ -1175,7 +1258,7 @@ async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         db_bots_set_enabled(uname, 0)
         await BOT_MANAGER.stop_client(uname)
         db_pending_clear(bot_key, user.id)
-        return await msg.reply_text(f"⏹ @{uname} sudah STOP.", reply_markup=admin_panel_kb())
+        return await msg.reply_text(f"⏹ @{uname} sudah STOP.", reply_markup=admin_panel_kb(is_manager=True))
 
     if action == "bot_remove":
         uname = text.lstrip("@").strip()
@@ -1185,15 +1268,16 @@ async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await BOT_MANAGER.stop_client(uname)
         db_bots_delete(uname)
         db_pending_clear(bot_key, user.id)
-        return await msg.reply_text(f"🗑 @{uname} sudah dihapus dari DB.", reply_markup=admin_panel_kb())
+        return await msg.reply_text(f"🗑 @{uname} sudah dihapus dari DB.", reply_markup=admin_panel_kb(is_manager=True))
 
+    # Client/Owner settings
     if action == "fsub_add":
         ch = normalize_channel_input(text)
         if not ch:
             return await msg.reply_text("Format tidak valid. Kirim @username atau -100id.")
         db_fsub_add(bot_key, ch)
         db_pending_clear(bot_key, user.id)
-        return await msg.reply_text(f"✅ FSUB ditambah: {ch}", reply_markup=admin_panel_kb())
+        return await msg.reply_text(f"✅ FSUB ditambah: {ch}", reply_markup=admin_panel_kb(is_manager=False))
 
     if action == "fsub_shown":
         if not text.isdigit():
@@ -1201,7 +1285,7 @@ async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         n = max(1, min(int(text), 20))
         db_botcfg_set(bot_key, "fsub_show_n", str(n))
         db_pending_clear(bot_key, user.id)
-        return await msg.reply_text(f"✅ Show N diset jadi {n}", reply_markup=admin_panel_kb())
+        return await msg.reply_text(f"✅ Show N diset jadi {n}", reply_markup=admin_panel_kb(is_manager=False))
 
     if action == "post_add":
         parts = text.split(None, 1)
@@ -1214,17 +1298,17 @@ async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         title = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "CH"
         db_post_add(bot_key, cid, title)
         db_pending_clear(bot_key, user.id)
-        return await msg.reply_text(f"✅ POST target ditambah: {title} ({cid})", reply_markup=admin_panel_kb())
+        return await msg.reply_text(f"✅ POST target ditambah: {title} ({cid})", reply_markup=admin_panel_kb(is_manager=False))
 
 
 # =========================
-# THUMB COMMANDS (UNCHANGED)
+# THUMB COMMANDS (GLOBAL)
 # =========================
 async def setthumb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-    if not user or not is_admin(user.id):
-        return await msg.reply_text("Khusus admin.")
+    if not user or not is_superadmin(user.id):
+        return await msg.reply_text("Khusus superadmin (global).")
     if not msg.reply_to_message or not msg.reply_to_message.photo:
         return await msg.reply_text("Cara pakai:\n1) Kirim FOTO\n2) Reply foto itu\n3) /setthumb")
     photo = msg.reply_to_message.photo[-1]
@@ -1235,8 +1319,8 @@ async def setthumb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def showthumb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-    if not user or not is_admin(user.id):
-        return await msg.reply_text("Khusus admin.")
+    if not user or not is_superadmin(user.id):
+        return await msg.reply_text("Khusus superadmin (global).")
     fid = db_get("custom_thumb_file_id")
     if not fid:
         return await msg.reply_text("Belum ada thumbnail custom.")
@@ -1246,8 +1330,8 @@ async def showthumb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delthumb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-    if not user or not is_admin(user.id):
-        return await msg.reply_text("Khusus admin.")
+    if not user or not is_superadmin(user.id):
+        return await msg.reply_text("Khusus superadmin (global).")
     db_del("custom_thumb_file_id")
     await msg.reply_text("✅ Thumbnail custom dihapus.")
 
@@ -1261,10 +1345,12 @@ async def build_manager_app() -> Application:
 
     me = await app.bot.get_me()
     manager_username = MANAGER_USERNAME_ENV or (me.username or "").lstrip("@") or "manager"
+
     app.bot_data["BOT_KEY"] = manager_username
     app.bot_data["BOT_USERNAME"] = manager_username
+    app.bot_data["IS_MANAGER"] = True
 
-    # wire handlers same as clients
+    # wire handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(fsub_check_cb, pattern=r"^chk:"))
     app.add_handler(CallbackQueryHandler(fsub_rotate_cb, pattern=r"^rot:"))
@@ -1284,7 +1370,7 @@ async def build_manager_app() -> Application:
 
 
 # =========================
-# RUN LOOP (THIS IS THE KEY FIX)
+# RUN LOOP (HOLDS PROCESS)
 # =========================
 async def run_all():
     if not MANAGER_TOKEN or DB_CHANNEL_ID == 0 or not ADMIN_IDS:
@@ -1302,13 +1388,12 @@ async def run_all():
     # start enabled clients from DB
     await BOT_MANAGER.load_and_start_all()
 
-    # start polling manager (non-blocking start)
+    # start polling manager
     await manager_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-    # HOLD PROCESS UNTIL SIGINT/SIGTERM
+    # HOLD until SIGINT/SIGTERM
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop_event.set)
@@ -1318,14 +1403,10 @@ async def run_all():
     print("RUNNING: manager polling active. Press Ctrl+C to stop.")
     await stop_event.wait()
 
-    # graceful shutdown
-    print("Stopping...")
-
-    # stop all clients
+    # shutdown
     for bk in list(BOT_MANAGER.apps.keys()):
         await BOT_MANAGER.stop_client(bk)
 
-    # stop manager
     try:
         await manager_app.updater.stop()
     except Exception:
