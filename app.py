@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Tuple
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -50,7 +51,6 @@ CAPTION_TEMPLATE = os.getenv(
     "Klik tombol di bawah untuk ambil videonya."
 )
 
-
 # =========================
 # PERMISSIONS
 # =========================
@@ -64,6 +64,72 @@ def get_bot_key(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
     return (context.application.bot_data.get("BOT_USERNAME") or "").strip().lstrip("@") or "unknown"
+
+
+# =========================
+# SAFE EDIT HELPERS (FIX "Message is not modified")
+# =========================
+def _norm_text(s: str | None) -> str:
+    return (s or "").strip()
+
+
+def _markup_same(a, b) -> bool:
+    return str(a) == str(b)
+
+
+async def safe_edit_text(
+    q,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+    disable_web_page_preview: bool | None = None,
+):
+    """
+    Kebal 'Message is not modified' + kebal race/click spam.
+    """
+    msg = q.message
+    old_text = _norm_text(getattr(msg, "text", None) or getattr(msg, "caption", None))
+    new_text = _norm_text(text)
+    old_markup = getattr(msg, "reply_markup", None)
+
+    if old_text == new_text and _markup_same(old_markup, reply_markup):
+        return
+
+    try:
+        await q.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except BadRequest as e:
+        s = str(e)
+        if "Message is not modified" in s:
+            return
+        if "message to edit not found" in s.lower():
+            return
+        raise
+
+
+async def safe_edit_markup(q, reply_markup: InlineKeyboardMarkup | None = None):
+    """
+    Kebal 'Message is not modified' untuk edit markup doang.
+    """
+    msg = q.message
+    old_markup = getattr(msg, "reply_markup", None)
+
+    if _markup_same(old_markup, reply_markup):
+        return
+
+    try:
+        await q.edit_message_reply_markup(reply_markup=reply_markup)
+    except BadRequest as e:
+        s = str(e)
+        if "Message is not modified" in s:
+            return
+        if "message to edit not found" in s.lower():
+            return
+        raise
 
 
 # =========================
@@ -962,7 +1028,7 @@ async def fsub_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    await q.answer()
+    await q.answer("Cek join...")
 
     bot_key = get_bot_key(context)
     data = q.data or ""
@@ -976,7 +1042,7 @@ async def fsub_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_msg_id = db_get_file(use_key, real_token)
     if not db_msg_id:
-        return await q.edit_message_text("Token/link tidak valid atau sudah dihapus.")
+        return await safe_edit_text(q, "Token/link tidak valid atau sudah dihapus.")
 
     user_id = q.from_user.id
     joined = await is_user_joined_all(context, use_key, user_id)
@@ -986,7 +1052,8 @@ async def fsub_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         show_n = get_fsub_show_n(use_key)
         db_step_fsub_offset(use_key, real_token, user_id, show_n, total=len(fsubs))
         kb = await build_fsub_keyboard(context, use_key, real_token, user_id)
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "🔒 Masih belum join semua channel wajib.\n"
             "Join dulu, lalu klik ✅ Sudah Join lagi.\n\n"
             "List join bakal ganti otomatis biar nggak monoton.",
@@ -999,16 +1066,16 @@ async def fsub_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_chat_id=DB_CHANNEL_ID,
             message_id=db_msg_id,
         )
-        await q.edit_message_text("✅ Videonya sudah aku kirim ke chat kamu.")
+        await safe_edit_text(q, "✅ Videonya sudah aku kirim ke chat kamu.")
     except Exception as e:
-        await q.edit_message_text(f"Gagal ngirim video: {e}")
+        await safe_edit_text(q, f"Gagal ngirim video: {e}")
 
 
 async def fsub_rotate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    await q.answer()
+    await q.answer("Ganti list...")
 
     bot_key = get_bot_key(context)
     data = q.data or ""
@@ -1026,7 +1093,7 @@ async def fsub_rotate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_step_fsub_offset(use_key, real_token, user_id, show_n, total=len(fsubs))
     kb = await build_fsub_keyboard(context, use_key, real_token, user_id)
-    return await q.edit_message_reply_markup(reply_markup=kb)
+    return await safe_edit_markup(q, reply_markup=kb)
 
 
 # =========================
@@ -1075,7 +1142,7 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    await q.answer()
+    await q.answer("Proses...")
 
     bot_key = get_bot_key(context)
     bot_u = get_bot_username(context)
@@ -1086,16 +1153,15 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = data.split("cancel:", 1)[1].strip()
         up = db_get_upload(bot_key, token)
         if not up:
-            return await q.edit_message_text("Session udah nggak ada / token invalid.")
+            return await safe_edit_text(q, "Session udah nggak ada / token invalid.")
         uploader_id, _ = up
 
-        # uploader atau admin bot boleh cancel
         is_manager = bool(context.application.bot_data.get("IS_MANAGER", False))
         if q.from_user.id != uploader_id and not can_manage_bot(bot_key, q.from_user.id, is_manager=is_manager):
             return await q.answer("Bukan upload kamu.", show_alert=True)
 
         db_del_upload(bot_key, token)
-        return await q.edit_message_text("✖️ Dibatalkan. Videonya tetap aman di DB.")
+        return await safe_edit_text(q, "✖️ Dibatalkan. Videonya tetap aman di DB.")
 
     if data.startswith("post:"):
         try:
@@ -1106,7 +1172,7 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         up = db_get_upload(bot_key, token)
         if not up:
-            return await q.edit_message_text("Session udah nggak ada / token invalid.")
+            return await safe_edit_text(q, "Session udah nggak ada / token invalid.")
         uploader_id, thumb_file_id = up
 
         is_manager = bool(context.application.bot_data.get("IS_MANAGER", False))
@@ -1114,7 +1180,7 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await q.answer("Bukan upload kamu.", show_alert=True)
 
         if idx < 1 or idx > len(post_channels):
-            return await q.edit_message_text("Channel index invalid.")
+            return await safe_edit_text(q, "Channel index invalid.")
 
         channel_id, title = post_channels[idx - 1]
         caption = (
@@ -1127,16 +1193,16 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await _post_to_channel(context, channel_id, caption, deep_link(bot_u, token), thumb_file_id)
         except Exception as e:
-            return await q.edit_message_text(f"Gagal posting ke {title}: {e}")
+            return await safe_edit_text(q, f"Gagal posting ke {title}: {e}")
 
         db_del_upload(bot_key, token)
-        return await q.edit_message_text(f"✅ Posted ke {title}.")
+        return await safe_edit_text(q, f"✅ Posted ke {title}.")
 
     if data.startswith("postall:"):
         token = data.split("postall:", 1)[1].strip()
         up = db_get_upload(bot_key, token)
         if not up:
-            return await q.edit_message_text("Session udah nggak ada / token invalid.")
+            return await safe_edit_text(q, "Session udah nggak ada / token invalid.")
         uploader_id, thumb_file_id = up
 
         is_manager = bool(context.application.bot_data.get("IS_MANAGER", False))
@@ -1161,10 +1227,11 @@ async def post_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         db_del_upload(bot_key, token)
         if fail:
-            return await q.edit_message_text(
+            return await safe_edit_text(
+                q,
                 f"✅ Posted ke {ok}/{len(post_channels)} channel.\n\nYang gagal:\n" + "\n".join(fail)
             )
-        return await q.edit_message_text(f"✅ Posted ke semua channel ({ok}).")
+        return await safe_edit_text(q, f"✅ Posted ke semua channel ({ok}).")
 
 
 # =========================
@@ -1235,35 +1302,36 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await q.answer("Akses ditolak.", show_alert=True)
 
     data = q.data or ""
-    await q.answer()
+    await q.answer("Oke...")
 
     if data == "adm:close":
         try:
-            return await q.edit_message_text("Closed.")
+            return await safe_edit_text(q, "Closed.")
         except Exception:
             return
 
     if data == "adm:back":
-        return await q.edit_message_text("Admin Panel:", reply_markup=admin_panel_kb(is_manager=is_manager))
+        return await safe_edit_text(q, "Admin Panel:", reply_markup=admin_panel_kb(is_manager=is_manager))
 
     if data == "adm:cancel":
         db_pending_clear(bot_key, user.id)
-        return await q.edit_message_text("Input mode dibatalkan.", reply_markup=admin_panel_kb(is_manager=is_manager))
+        return await safe_edit_text(q, "Input mode dibatalkan.", reply_markup=admin_panel_kb(is_manager=is_manager))
 
     # panels
     if data == "adm:fsub":
-        return await q.edit_message_text("FSUB Panel:", reply_markup=fsub_panel_kb())
+        return await safe_edit_text(q, "FSUB Panel:", reply_markup=fsub_panel_kb())
 
     if data == "adm:post":
-        return await q.edit_message_text("POST Panel:", reply_markup=post_panel_kb())
+        return await safe_edit_text(q, "POST Panel:", reply_markup=post_panel_kb())
 
     if data == "adm:access":
         if is_manager:
-            return await q.edit_message_text("AKSES hanya untuk bot client (bukan manager).", reply_markup=admin_panel_kb(is_manager=True))
-        return await q.edit_message_text("AKSES Panel:", reply_markup=access_panel_kb())
+            return await safe_edit_text(q, "AKSES hanya untuk bot client (bukan manager).", reply_markup=admin_panel_kb(is_manager=True))
+        return await safe_edit_text(q, "AKSES Panel:", reply_markup=access_panel_kb())
 
     if data == "adm:thumb":
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "Thumb (global superadmin):\n"
             "• Reply foto → /setthumb\n"
             "• /showthumb\n"
@@ -1275,11 +1343,12 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:bots":
         if not is_manager:
             return await q.answer("Menu ini cuma ada di manager.", show_alert=True)
-        return await q.edit_message_text("BOTS Panel:", reply_markup=bots_panel_kb())
+        return await safe_edit_text(q, "BOTS Panel:", reply_markup=bots_panel_kb())
 
     if data == "adm:bots:add":
         db_pending_set(bot_key, user.id, "bot_add_token")
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "Kirim BOT TOKEN dari BotFather.\n"
             "Setelah token valid, aku akan minta ID yang boleh akses bot itu.\n\n"
             "Ketik /help kalau kamu butuh format.",
@@ -1289,24 +1358,26 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:bots:list":
         bots = db_bots_list()
         if not bots:
-            return await q.edit_message_text("Belum ada bot client.", reply_markup=bots_panel_kb())
+            return await safe_edit_text(q, "Belum ada bot client.", reply_markup=bots_panel_kb())
         lines = []
         for bk, u, en, oid in bots:
             status = "ON" if en == 1 else "OFF"
             running = "RUN" if BOT_MANAGER.is_running(bk) else "STOP"
             lines.append(f"• @{u} | {status} | {running} | owner:{oid}")
-        return await q.edit_message_text("Bots:\n" + "\n".join(lines), reply_markup=bots_panel_kb())
+        return await safe_edit_text(q, "Bots:\n" + "\n".join(lines), reply_markup=bots_panel_kb())
 
     if data == "adm:bots:stop":
         db_pending_set(bot_key, user.id, "bot_stop")
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "Kirim username bot yang mau di-STOP (tanpa @).",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
         )
 
     if data == "adm:bots:remove":
         db_pending_set(bot_key, user.id, "bot_remove")
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "Kirim username bot yang mau dihapus (tanpa @).",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
         )
@@ -1314,7 +1385,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # FSUB actions
     if data == "adm:fsub:add":
         db_pending_set(bot_key, user.id, "fsub_add")
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "Kirim channel FSUB: @username atau -100id atau username.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
         )
@@ -1322,7 +1394,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:fsub:shown":
         db_pending_set(bot_key, user.id, "fsub_shown")
         cur = get_fsub_show_n(bot_key)
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             f"Kirim angka jumlah tombol join tampil (1-20). Saat ini: {cur}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
         )
@@ -1330,21 +1403,22 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:fsub:list":
         chans = db_fsub_list(bot_key)
         text = "FSUB List:\n" + ("\n".join([f"• {c}" for c in chans]) if chans else "— kosong —")
-        return await q.edit_message_text(text, reply_markup=fsub_list_kb(bot_key))
+        return await safe_edit_text(q, text, reply_markup=fsub_list_kb(bot_key))
 
     if data == "adm:fsub:clear":
         db_fsub_clear(bot_key)
-        return await q.edit_message_text("✅ FSUB cleared.", reply_markup=fsub_panel_kb())
+        return await safe_edit_text(q, "✅ FSUB cleared.", reply_markup=fsub_panel_kb())
 
     if data.startswith("adm:fsub:del:"):
         ch = data.split("adm:fsub:del:", 1)[1].strip()
         db_fsub_del(bot_key, ch)
-        return await q.edit_message_text("✅ Deleted.", reply_markup=fsub_list_kb(bot_key))
+        return await safe_edit_text(q, "✅ Deleted.", reply_markup=fsub_list_kb(bot_key))
 
     # POST actions
     if data == "adm:post:add":
         db_pending_set(bot_key, user.id, "post_add")
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "Kirim target POST:\nFormat: -100id Judul\nContoh: -1001234567890 CH1",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
         )
@@ -1352,11 +1426,11 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:post:list":
         chans = db_post_list(bot_key)
         text = "POST Targets:\n" + ("\n".join([f"• {t} ({cid})" for cid, t in chans]) if chans else "— kosong —")
-        return await q.edit_message_text(text, reply_markup=post_list_kb(bot_key))
+        return await safe_edit_text(q, text, reply_markup=post_list_kb(bot_key))
 
     if data == "adm:post:clear":
         db_post_clear(bot_key)
-        return await q.edit_message_text("✅ POST targets cleared.", reply_markup=post_panel_kb())
+        return await safe_edit_text(q, "✅ POST targets cleared.", reply_markup=post_panel_kb())
 
     if data.startswith("adm:post:del:"):
         cid_s = data.split("adm:post:del:", 1)[1].strip()
@@ -1365,14 +1439,15 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             return
         db_post_del(bot_key, cid)
-        return await q.edit_message_text("✅ Deleted.", reply_markup=post_list_kb(bot_key))
+        return await safe_edit_text(q, "✅ Deleted.", reply_markup=post_list_kb(bot_key))
 
     # ACCESS actions (client only)
     if data == "adm:access:add":
         if is_manager:
             return
         db_pending_set(bot_key, user.id, "access_add")
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "Kirim ID yang boleh akses (pisah koma/spasi). Contoh:\n<code>13312413, 13124211</code>\n\nKetik <code>skip</code> untuk batal.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
@@ -1382,7 +1457,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_manager:
             return
         db_pending_set(bot_key, user.id, "access_del")
-        return await q.edit_message_text(
+        return await safe_edit_text(
+            q,
             "Kirim 1 user_id yang mau dihapus aksesnya.\nContoh: <code>13312413</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="adm:cancel")]]),
@@ -1390,18 +1466,18 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "adm:access:list":
         if is_manager:
-            return await q.edit_message_text("AKSES hanya untuk bot client.", reply_markup=admin_panel_kb(is_manager=True))
+            return await safe_edit_text(q, "AKSES hanya untuk bot client.", reply_markup=admin_panel_kb(is_manager=True))
         lst = db_access_list(bot_key)
         if not lst:
-            return await q.edit_message_text("Belum ada akses terset.", reply_markup=access_panel_kb())
+            return await safe_edit_text(q, "Belum ada akses terset.", reply_markup=access_panel_kb())
         lines = [f"• {uid} ({role})" for uid, role in lst]
-        return await q.edit_message_text("Akses list:\n" + "\n".join(lines), reply_markup=access_panel_kb())
+        return await safe_edit_text(q, "Akses list:\n" + "\n".join(lines), reply_markup=access_panel_kb())
 
     if data == "adm:access:clear":
         if is_manager:
             return
         db_access_clear(bot_key)
-        return await q.edit_message_text("✅ Semua akses dihapus. (Pastikan owner masih kamu tambahin lagi!)", reply_markup=access_panel_kb())
+        return await safe_edit_text(q, "✅ Semua akses dihapus. (Pastikan owner masih kamu tambahin lagi!)", reply_markup=access_panel_kb())
 
 
 async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1533,24 +1609,23 @@ async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             return await msg.reply_text("Tidak ada ID valid. Kirim angka user_id (pisah koma/spasi).")
 
         for uid in ids:
-            # jangan turunin owner jadi admin; kalau uid sama owner, keep owner
             role = "admin"
-            # kalau dia owner, set owner tetap
             current = _db_fetchone("SELECT role FROM bot_access WHERE bot_key=? AND user_id=?", (bot_key, int(uid)))
             if current and current[0] == "owner":
                 role = "owner"
             db_access_add(bot_key, uid, role=role)
 
         db_pending_clear(bot_key, user.id)
-        return await msg.reply_text("✅ Akses ditambahkan:\n" + "\n".join([f"• {x}" for x in ids]),
-                                    reply_markup=admin_panel_kb(is_manager=False))
+        return await msg.reply_text(
+            "✅ Akses ditambahkan:\n" + "\n".join([f"• {x}" for x in ids]),
+            reply_markup=admin_panel_kb(is_manager=False)
+        )
 
     if action == "access_del":
         if not text.isdigit():
             return await msg.reply_text("Kirim 1 user_id angka.")
         uid = int(text)
 
-        # prevent removing owner by mistake
         row = _db_fetchone("SELECT role FROM bot_access WHERE bot_key=? AND user_id=?", (bot_key, uid))
         if row and row[0] == "owner":
             return await msg.reply_text("Owner tidak bisa dihapus dari akses lewat menu ini. (Safety)")
